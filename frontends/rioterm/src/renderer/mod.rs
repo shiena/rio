@@ -480,10 +480,18 @@ impl Renderer {
                 .map(|p| p.is_ime_cursor_at(visible_row_index, column))
                 .unwrap_or(false);
 
-            if matches!(square.wide(), Wide::Spacer)
-                && preedit_cell.is_none()
-                && !ime_cursor_here
-            {
+            // Skip spacer slots. Wide glyphs advance for two cells on their
+            // own, so the continuation cell must not emit another glyph
+            // (otherwise layout adds extra width and the composition looks
+            // spread out with gaps). This covers both the underlying
+            // terminal grid's Wide::Spacer and the overlay's
+            // PreeditCell::Spacer placed after a wide preedit char.
+            let is_preedit_spacer = matches!(preedit_cell, Some(PreeditCell::Spacer));
+            let is_underlying_spacer = matches!(square.wide(), Wide::Spacer);
+            if is_preedit_spacer {
+                continue;
+            }
+            if is_underlying_spacer && preedit_cell.is_none() && !ime_cursor_here {
                 continue;
             }
 
@@ -548,11 +556,10 @@ impl Renderer {
             // Override content with the preedit character BEFORE the '\0'
             // early-continue so cells whose underlying square is empty (e.g.
             // typing IME past end-of-line) still render the composing text.
-            if let Some(cell) = preedit_cell {
-                square_content = match cell {
-                    PreeditCell::Char(ch) => ch,
-                    PreeditCell::Spacer => ' ',
-                };
+            // Spacer cells are skipped above, so only PreeditCell::Char
+            // reaches here.
+            if let Some(PreeditCell::Char(ch)) = preedit_cell {
+                square_content = ch;
             }
 
             // Check selection before any early returns so '\0' cells get highlights
@@ -717,6 +724,12 @@ impl Renderer {
                 }
                 style.decoration = None;
                 style.decoration_color = None;
+                // Force plain font attributes for the composing text so it
+                // isn't italicised / bolded by whatever terminal style
+                // happened to be under the cursor (e.g. an italic prompt
+                // segment from Starship/oh-my-posh).
+                style.font_attrs =
+                    Attributes::new(Stretch::NORMAL, Weight::NORMAL, Style::Normal);
             }
 
             // Kitty Unicode placeholder (U+10EEEE): render as transparent
