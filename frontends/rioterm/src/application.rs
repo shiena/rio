@@ -1574,7 +1574,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                 .current_mut()
                                 .renderable_content
                                 .pending_update
-                                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                                .set_terminal_damage(
+                                    rio_backend::event::TerminalDamage::Full,
+                                );
                             route
                                 .window
                                 .screen

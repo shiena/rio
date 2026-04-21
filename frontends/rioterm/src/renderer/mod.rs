@@ -48,6 +48,11 @@ enum PreeditCell {
 struct PreeditOverlay {
     columns: usize,
     cells: Vec<Option<PreeditCell>>,
+    // Position of the IME cursor within the preedit, in (row, col) of the
+    // visible grid. `None` when the IME didn't report a cursor offset or
+    // when it falls at the very start (which already coincides with the
+    // terminal cursor).
+    ime_cursor_pos: Option<(usize, usize)>,
 }
 
 impl PreeditOverlay {
@@ -65,8 +70,29 @@ impl PreeditOverlay {
         let mut cells = vec![None; rows.saturating_mul(columns)];
         let mut row = start_row;
         let mut col = start_col;
+        let mut byte: usize = 0;
+        let mut ime_cursor_pos = None;
+        let cursor_byte_offset = preedit.cursor_byte_offset;
+
+        let record_ime_cursor = |r: usize, c: usize, out: &mut Option<(usize, usize)>| {
+            if r < rows && c < columns {
+                *out = Some((r, c));
+            }
+        };
 
         for ch in preedit.text.chars() {
+            // Record the IME cursor position BEFORE placing the char when
+            // the cursor's byte offset lands right before it. We do this
+            // before any wrap adjustments so the cursor sits next to the
+            // cell the IME is about to edit.
+            if cursor_byte_offset == Some(byte) && ime_cursor_pos.is_none() {
+                if col >= columns && row + 1 < rows {
+                    record_ime_cursor(row + 1, 0, &mut ime_cursor_pos);
+                } else {
+                    record_ime_cursor(row, col, &mut ime_cursor_pos);
+                }
+            }
+
             if row >= rows {
                 break;
             }
@@ -100,6 +126,7 @@ impl PreeditOverlay {
                 }
             }
 
+            byte = byte.saturating_add(ch.len_utf8());
             col = col.saturating_add(width);
             if col >= columns {
                 row += 1;
@@ -107,12 +134,25 @@ impl PreeditOverlay {
             }
         }
 
-        Some(Self { columns, cells })
+        // IME cursor at the end of the preedit text.
+        if cursor_byte_offset == Some(preedit.text.len()) && ime_cursor_pos.is_none() {
+            record_ime_cursor(row, col, &mut ime_cursor_pos);
+        }
+
+        Some(Self {
+            columns,
+            cells,
+            ime_cursor_pos,
+        })
     }
 
     fn get(&self, row: usize, col: usize) -> Option<PreeditCell> {
         let idx = row.checked_mul(self.columns)?.saturating_add(col);
         self.cells.get(idx).copied().flatten()
+    }
+
+    fn is_ime_cursor_at(&self, row: usize, col: usize) -> bool {
+        self.ime_cursor_pos == Some((row, col))
     }
 }
 
@@ -436,8 +476,22 @@ impl Renderer {
             let square = &row.inner[column];
             let preedit_cell =
                 ime_preedit.and_then(|preedit| preedit.get(visible_row_index, column));
+            let ime_cursor_here = ime_preedit
+                .map(|p| p.is_ime_cursor_at(visible_row_index, column))
+                .unwrap_or(false);
 
-            if matches!(square.wide(), Wide::Spacer) && preedit_cell.is_none() {
+            // Skip spacer slots. Wide glyphs advance for two cells on their
+            // own, so the continuation cell must not emit another glyph
+            // (otherwise layout adds extra width and the composition looks
+            // spread out with gaps). This covers both the underlying
+            // terminal grid's Wide::Spacer and the overlay's
+            // PreeditCell::Spacer placed after a wide preedit char.
+            let is_preedit_spacer = matches!(preedit_cell, Some(PreeditCell::Spacer));
+            let is_underlying_spacer = matches!(square.wide(), Wide::Spacer);
+            if is_preedit_spacer {
+                continue;
+            }
+            if is_underlying_spacer && preedit_cell.is_none() && !ime_cursor_here {
                 continue;
             }
 
@@ -499,6 +553,15 @@ impl Renderer {
                     self.create_style(square, cell_style, term_colors)
                 };
 
+            // Override content with the preedit character BEFORE the '\0'
+            // early-continue so cells whose underlying square is empty (e.g.
+            // typing IME past end-of-line) still render the composing text.
+            // Spacer cells are skipped above, so only PreeditCell::Char
+            // reaches here.
+            if let Some(PreeditCell::Char(ch)) = preedit_cell {
+                square_content = ch;
+            }
+
             // Check selection before any early returns so '\0' cells get highlights
             if let Some(ref range) = selection_range {
                 let pos = Pos::new(line, Column(column));
@@ -510,6 +573,26 @@ impl Renderer {
                     };
                     style.background_color = Some(self.named_colors.selection_background);
                 }
+            }
+
+            // Place the IME cursor beam for cells that sit past the preedit
+            // text (empty cells where `cursor_byte_offset == text.len()`).
+            // These cells hit the `\0` early-continue, but the blank-run
+            // renderer still honors `style.cursor`, so set it before bailing.
+            if ime_cursor_here
+                && preedit_cell.is_none()
+                && !(has_cursor && column == cursor.state.pos.col)
+            {
+                let cursor_color = if !self.is_vi_mode_enabled {
+                    term_colors[NamedColor::Cursor].unwrap_or(self.named_colors.cursor)
+                } else {
+                    self.named_colors.vi_cursor
+                };
+                style.cursor = Some(SugarCursor {
+                    kind: CursorKind::Caret,
+                    color: cursor_color,
+                    order: 0,
+                });
             }
 
             if square_content == '\0' {
@@ -607,21 +690,46 @@ impl Renderer {
                 );
             }
 
-            if let Some(cell) = preedit_cell {
-                match cell {
-                    PreeditCell::Char(ch) => {
-                        square_content = ch;
-                    }
-                    PreeditCell::Spacer => {
-                        square_content = ' ';
-                    }
+            if preedit_cell.is_some() {
+                let cursor_color = if !self.is_vi_mode_enabled {
+                    term_colors[NamedColor::Cursor].unwrap_or(self.named_colors.cursor)
+                } else {
+                    self.named_colors.vi_cursor
+                };
+                // wezterm-style wide cursor: every composition cell is
+                // rendered with reverse-video block styling so the whole
+                // preedit reads as a single highlighted region regardless
+                // of the user's configured CursorShape. This replaces the
+                // earlier dim-foreground treatment whose per-cell gaps
+                // made multi-character CJK compositions hard to read.
+                let is_ime_caret_cell =
+                    ime_cursor_here && !(has_cursor && column == cursor.state.pos.col);
+                if is_ime_caret_cell {
+                    // Break the block at the IME cursor with a beam so the
+                    // user can see where arrow-key navigation sits inside
+                    // the composition. The beam uses normal text color so
+                    // it stands out against the surrounding block.
+                    style.cursor = Some(SugarCursor {
+                        kind: CursorKind::Caret,
+                        color: cursor_color,
+                        order: 0,
+                    });
+                } else {
+                    style.color = self.named_colors.background.0;
+                    style.cursor = Some(SugarCursor {
+                        kind: CursorKind::Block,
+                        color: cursor_color,
+                        order: 0,
+                    });
                 }
-                if !(has_cursor && column == cursor.state.pos.col) {
-                    style.color =
-                        self.color(NamedColor::DimForeground as usize, term_colors);
-                    style.decoration = None;
-                    style.decoration_color = None;
-                }
+                style.decoration = None;
+                style.decoration_color = None;
+                // Force plain font attributes for the composing text so it
+                // isn't italicised / bolded by whatever terminal style
+                // happened to be under the cursor (e.g. an italic prompt
+                // segment from Starship/oh-my-posh).
+                style.font_attrs =
+                    Attributes::new(Stretch::NORMAL, Weight::NORMAL, Style::Normal);
             }
 
             // Kitty Unicode placeholder (U+10EEEE): render as transparent
@@ -2045,5 +2153,59 @@ mod tests {
         assert_eq!(overlay.get(0, 2), None);
         assert_eq!(overlay.get(1, 0), Some(PreeditCell::Char('啊')));
         assert_eq!(overlay.get(1, 1), Some(PreeditCell::Spacer));
+    }
+
+    #[test]
+    fn preedit_overlay_tracks_ime_cursor_at_end() {
+        // Typical Japanese IME: "あい" with the IME cursor at the end of
+        // the composition (byte_offset == text.len()). Width is 4 cells;
+        // the cursor lands on the cell just past the composition.
+        let text = "あい".to_string();
+        let len = text.len();
+        let preedit = Preedit::new(text, Some(len));
+        let overlay = PreeditOverlay::new(&preedit, 0, 0, 10, 1).unwrap();
+
+        assert_eq!(overlay.get(0, 0), Some(PreeditCell::Char('あ')));
+        assert_eq!(overlay.get(0, 1), Some(PreeditCell::Spacer));
+        assert_eq!(overlay.get(0, 2), Some(PreeditCell::Char('い')));
+        assert_eq!(overlay.get(0, 3), Some(PreeditCell::Spacer));
+        assert!(overlay.is_ime_cursor_at(0, 4));
+        assert!(!overlay.is_ime_cursor_at(0, 0));
+        assert!(!overlay.is_ime_cursor_at(0, 3));
+    }
+
+    #[test]
+    fn preedit_overlay_tracks_ime_cursor_inside_preedit() {
+        // IME cursor placed between the two wide characters of "あい".
+        // "あ" is 3 bytes, so cursor_byte_offset == 3 puts the cursor at
+        // column 2 (start of the second wide char).
+        let preedit = Preedit::new("あい".to_string(), Some(3));
+        let overlay = PreeditOverlay::new(&preedit, 0, 0, 10, 1).unwrap();
+
+        assert!(overlay.is_ime_cursor_at(0, 2));
+        assert!(!overlay.is_ime_cursor_at(0, 0));
+        assert!(!overlay.is_ime_cursor_at(0, 4));
+    }
+
+    #[test]
+    fn preedit_overlay_no_ime_cursor_when_offset_none() {
+        let preedit = Preedit::new("hi".to_string(), None);
+        let overlay = PreeditOverlay::new(&preedit, 0, 0, 10, 1).unwrap();
+
+        assert!(!overlay.is_ime_cursor_at(0, 0));
+        assert!(!overlay.is_ime_cursor_at(0, 1));
+        assert!(!overlay.is_ime_cursor_at(0, 2));
+    }
+
+    #[test]
+    fn preedit_overlay_ime_cursor_at_start_matches_terminal_cursor() {
+        // cursor_byte_offset == 0 places the IME cursor on the same cell
+        // as the terminal cursor (the preedit start column). The render
+        // path intentionally suppresses the beam there so the two don't
+        // stack, but the overlay still reports the position.
+        let preedit = Preedit::new("abc".to_string(), Some(0));
+        let overlay = PreeditOverlay::new(&preedit, 0, 2, 10, 1).unwrap();
+
+        assert!(overlay.is_ime_cursor_at(0, 2));
     }
 }
