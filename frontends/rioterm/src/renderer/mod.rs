@@ -684,41 +684,39 @@ impl Renderer {
             }
 
             if preedit_cell.is_some() {
-                let is_terminal_cursor = has_cursor && column == cursor.state.pos.col;
-                // Non-cursor preedit cells get dimmed foreground so the
-                // composition visually reads as "uncommitted" versus the
-                // surrounding terminal text. The terminal cursor cell keeps
-                // its cursor styling (inverted bg/fg) applied earlier.
-                if !is_terminal_cursor {
-                    style.color =
-                        self.color(NamedColor::DimForeground as usize, term_colors);
-                }
-                // Underline across every composition cell mirrors the
-                // wezterm/alacritty convention of visually marking the
-                // preedit region.
-                style.decoration = Some(SpanStyleDecoration::Underline(UnderlineInfo {
-                    is_doubled: false,
-                    shape: UnderlineShape::Regular,
-                }));
-                style.decoration_color = None;
-
-                // When the IME reports a cursor offset inside the preedit
-                // (e.g. moving the caret within a Japanese composition to
-                // correct an earlier character), surface it as a beam on
-                // that cell so the user can see where the IME will act.
-                if ime_cursor_here && !is_terminal_cursor {
-                    let cursor_color = if !self.is_vi_mode_enabled {
-                        term_colors[NamedColor::Cursor]
-                            .unwrap_or(self.named_colors.cursor)
-                    } else {
-                        self.named_colors.vi_cursor
-                    };
+                let cursor_color = if !self.is_vi_mode_enabled {
+                    term_colors[NamedColor::Cursor].unwrap_or(self.named_colors.cursor)
+                } else {
+                    self.named_colors.vi_cursor
+                };
+                // wezterm-style wide cursor: every composition cell is
+                // rendered with reverse-video block styling so the whole
+                // preedit reads as a single highlighted region regardless
+                // of the user's configured CursorShape. This replaces the
+                // earlier dim-foreground treatment whose per-cell gaps
+                // made multi-character CJK compositions hard to read.
+                let is_ime_caret_cell =
+                    ime_cursor_here && !(has_cursor && column == cursor.state.pos.col);
+                if is_ime_caret_cell {
+                    // Break the block at the IME cursor with a beam so the
+                    // user can see where arrow-key navigation sits inside
+                    // the composition. The beam uses normal text color so
+                    // it stands out against the surrounding block.
                     style.cursor = Some(SugarCursor {
                         kind: CursorKind::Caret,
                         color: cursor_color,
                         order: 0,
                     });
+                } else {
+                    style.color = self.named_colors.background.0;
+                    style.cursor = Some(SugarCursor {
+                        kind: CursorKind::Block,
+                        color: cursor_color,
+                        order: 0,
+                    });
                 }
+                style.decoration = None;
+                style.decoration_color = None;
             }
 
             // Kitty Unicode placeholder (U+10EEEE): render as transparent
