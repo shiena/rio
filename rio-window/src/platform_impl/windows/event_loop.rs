@@ -947,8 +947,7 @@ impl LazyMessageId {
             return id;
         }
 
-        // Register the message.
-        // assert!(self.name.ends_with('\0'));
+        // Register the message. The `w!()` macro guarantees a null-terminated UTF-16 string.
         let new_id = unsafe { RegisterWindowMessageW(self.name) };
 
         assert_ne!(
@@ -965,7 +964,7 @@ impl LazyMessageId {
             std::io::Error::last_os_error()
         );
 
-        // Store the new ID. Since `RegisterWindowMessageA` returns the same value for any given
+        // Store the new ID. Since `RegisterWindowMessageW` returns the same value for any given
         // string, the target value will always either be a). `INVALID_ID` or b). the
         // correct ID. Therefore a compare-and-swap operation here (or really any
         // consideration) is never necessary.
@@ -2949,23 +2948,11 @@ fn get_pointer_move_kind(
 /// `true` if the user confirmed the close. Mirrors macOS's NSAlert
 /// in `app_delegate.rs:applicationShouldTerminate`.
 unsafe fn confirm_close_native(hwnd: HWND) -> bool {
-    use std::ffi::OsStr;
-    use std::iter::once;
-    use std::os::windows::ffi::OsStrExt;
-
-    let title: Vec<u16> = OsStr::new("Close Rio terminal?")
-        .encode_wide()
-        .chain(once(0))
-        .collect();
-    let message: Vec<u16> = OsStr::new("All sessions in this window will be closed.")
-        .encode_wide()
-        .chain(once(0))
-        .collect();
     let response = unsafe {
         MessageBoxW(
             hwnd,
-            message.as_ptr(),
-            title.as_ptr(),
+            w!("All sessions in this window will be closed."),
+            w!("Close Rio terminal?"),
             MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL,
         )
     };
